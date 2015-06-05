@@ -1,0 +1,221 @@
+# lib/searchlight
+# Install and start **Searchlight** service
+
+# To enable Searchlight services, add the following to localrc
+# enable_service searchlight,searchlight-index,searchlight-api
+
+# stack.sh
+# ---------
+# install_searchlight
+# configure_searchlight
+# init_searchlight
+# start_searchlight
+# stop_searchlight
+# cleanup_searchlight
+
+# Save trace setting
+XTRACE=$(set +o | grep xtrace)
+set +o xtrace
+
+
+# Defaults
+# --------
+SEARCHLIGHT_PLUGINS=$TOP_DIR/lib/searchlight_plugins
+
+# Set up default repos
+SEARCHLIGHT_REPO=${SEARCHLIGHT_REPO:-${GIT_BASE}/openstack/searchlight.git}
+SEARCHLIGHT_BRANCH=${SEARCHLIGHT_BRANCH:-master}
+SEARCHLIGHTCLIENT_REPO=${SEARCHLIGHTCLIENT_REPO:-${GIT_BASE}/openstack/python-searchlightclient.git}
+SEARCHLIGHTCLIENT_BRANCH=${SEARCHLIGHTCLIENT_BRANCH:-master}
+
+# Set up default paths
+SEARCHLIGHT_BIN_DIR=$(get_python_exec_prefix)
+SEARCHLIGHT_DIR=$DEST/searchlight
+SEARCHLIGHTCLIENT_DIR=$DEST/python-searchlightclient
+SEARCHLIGHT_CONF_DIR=/etc/searchlight
+SEARCHLIGHT_STATE_PATH=${SEARCHLIGHT_STATE_PATH:=$DATA_DIR/searchlight}
+SEARCHLIGHT_CONF=$SEARCHLIGHT_CONF_DIR/searchlight-api.conf
+SEARCHLIGHT_LOG_DIR=/var/log/searchlight
+SEARCHLIGHT_AUTH_CACHE_DIR=${SEARCHLIGHT_AUTH_CACHE_DIR:-/var/cache/searchlight}
+SEARCHLIGHT_APIPASTE_CONF=$SEARCHLIGHT_CONF_DIR/searchlight-api-paste.ini
+
+# Public IP/Port Settings
+SEARCHLIGHT_SERVICE_PROTOCOL=${SEARCHLIGHT_SERVICE_PROTOCOL:-$SERVICE_PROTOCOL}
+SEARCHLIGHT_SERVICE_HOST=${SEARCHLIGHT_SERVICE_HOST:-$SERVICE_HOST}
+SEARCHLIGHT_SERVICE_PORT=${SEARCHLIGHT_SERVICE_PORT:-9393}
+SEARCHLIGHT_SERVICE_PORT_INT=${SEARCHLIGHT_SERVICE_PORT_INT:-19393}
+
+
+# Tell Tempest this project is present
+TEMPEST_SERVICES+=,searchlight
+
+# Get backend configuration
+# ----------------------------
+if is_service_enabled searchlight && [[ -r $SEARCHLIGHT_PLUGINS/backend-$SEARCHLIGHT_BACKEND_DRIVER ]]; then
+    # Load plugin
+    source $SEARCHLIGHT_PLUGINS/backend-$SEARCHLIGHT_BACKEND_DRIVER
+fi
+
+# Helper Functions
+# ----------------
+function setup_colorized_logging_searchlight {
+    local conf_file=$1
+    local conf_section=$2
+    local project_var=${3:-"project_name"}
+    local user_var=${4:-"user_name"}
+
+    setup_colorized_logging $conf_file $conf_section $project_var $user_var
+
+    # Override the logging_context_format_string value chosen by
+    # setup_colorized_logging.
+    iniset $conf_file $conf_section logging_context_format_string "%(asctime)s.%(msecs)03d %(color)s%(levelname)s %(name)s [[01;36m%(request_id)s [00;36m%(user_identity)s%(color)s] [01;35m%(instance)s%(color)s%(message)s[00m"
+}
+
+# DevStack Plugin
+# ---------------
+
+# cleanup_searchlight - Remove residual data files, anything left over from previous
+# runs that a clean run would need to clean up
+function cleanup_searchlight {
+    sudo rm -rf $SEARCHLIGHT_STATE_PATH $SEARCHLIGHT_AUTH_CACHE_DIR
+}
+
+# configure_searchlight - Set config files, create data dirs, etc
+function configure_searchlight {
+    [ ! -d $SEARCHLIGHT_CONF_DIR ] && sudo mkdir -m 755 -p $SEARCHLIGHT_CONF_DIR
+    sudo chown $STACK_USER $SEARCHLIGHT_CONF_DIR
+
+    [ ! -d $SEARCHLIGHT_LOG_DIR ] &&  sudo mkdir -m 755 -p $SEARCHLIGHT_LOG_DIR
+    sudo chown $STACK_USER $SEARCHLIGHT_LOG_DIR
+
+    # (Re)create ``searchlight.conf``
+    rm -f $SEARCHLIGHT_CONF
+
+    # General Configuration
+    iniset_rpc_backend searchlight $SEARCHLIGHT_CONF DEFAULT
+
+    iniset $SEARCHLIGHT_CONF DEFAULT debug $ENABLE_DEBUG_LOG_LEVEL
+    iniset $SEARCHLIGHT_CONF DEFAULT verbose True
+    iniset $SEARCHLIGHT_CONF DEFAULT state_path $SEARCHLIGHT_STATE_PATH
+
+    # Install the policy file for the API server
+    cp $SEARCHLIGHT_DIR/etc/policy.json $SEARCHLIGHT_CONF_DIR/policy.json
+    iniset $SEARCHLIGHT_CONF DEFAULT policy_file $SEARCHLIGHT_CONF_DIR/policy.json
+
+    # API Configuration
+    sudo cp $SEARCHLIGHT_DIR/etc/searchlight-api-paste.ini $SEARCHLIGHT_APIPASTE_CONF
+    iniset $SEARCHLIGHT_CONF DEFAULT public_endpoint $SEARCHLIGHT_SERVICE_PROTOCOL://$SEARCHLIGHT_SERVICE_HOST:$SEARCHLIGHT_SERVICE_PORT/
+
+    # Oslo Concurrency
+    iniset $SEARCHLIGHT_CONF oslo_concurrency lock_path "$SEARCHLIGHT_STATE_PATH"
+
+    # TLS Proxy Configuration
+    if is_service_enabled tls-proxy; then
+        # Set the service port for a proxy to take the original
+        iniset $SEARCHLIGHT_CONF service:api bind_port $SEARCHLIGHT_SERVICE_PORT_INT
+    else
+        iniset $SEARCHLIGHT_CONF service:api bind_port $SEARCHLIGHT_SERVICE_PORT
+    fi
+
+    # Logging Configuration
+    if [ "$SYSLOG" != "False" ]; then
+        iniset $SEARCHLIGHT_CONF DEFAULT use_syslog True
+    fi
+
+    # Format logging
+    if [ "$LOG_COLOR" == "True" ] && [ "$SYSLOG" == "False" ]; then
+        setup_colorized_logging_searchlight $SEARCHLIGHT_CONF DEFAULT "tenant" "user"
+    fi
+}
+
+# create_searchlight_accounts - Set up common required searchlight accounts
+
+# Tenant               User       Roles
+# ------------------------------------------------------------------
+# service              searchlight  admin        # if enabled
+function create_searchlight_accounts {
+    local service_tenant=$(openstack project list | awk "/ $SERVICE_TENANT_NAME / { print \$2 }")
+    local admin_role=$(openstack role list | awk "/ admin / { print \$2 }")
+
+    if [[ "$ENABLED_SERVICES" =~ "searchlight-api" ]]; then
+        local searchlight_user=$(get_or_create_user "searchlight" \
+            "$SERVICE_PASSWORD" $service_tenant)
+        get_or_add_user_project_role $admin_role $searchlight_user $service_tenant
+
+        if [[ "$KEYSTONE_CATALOG_BACKEND" = 'sql' ]]; then
+            local searchlight_service=$(get_or_create_service "searchlight" \
+                "search" "Searchlight Service")
+            get_or_create_endpoint $searchlight_service \
+                "$REGION_NAME" \
+                "$SEARCHLIGHT_SERVICE_PROTOCOL://$SEARCHLIGHT_SERVICE_HOST:$SEARCHLIGHT_SERVICE_PORT/" \
+                "$SEARCHLIGHT_SERVICE_PROTOCOL://$SEARCHLIGHT_SERVICE_HOST:$SEARCHLIGHT_SERVICE_PORT/" \
+                "$SEARCHLIGHT_SERVICE_PROTOCOL://$SEARCHLIGHT_SERVICE_HOST:$SEARCHLIGHT_SERVICE_PORT/"
+        fi
+    fi
+}
+
+# init_searchlight - Initialize etc.
+function init_searchlight {
+    # Create cache dir
+    sudo mkdir -p $SEARCHLIGHT_AUTH_CACHE_DIR
+    sudo chown $STACK_USER $SEARCHLIGHT_AUTH_CACHE_DIR
+    rm -f $SEARCHLIGHT_AUTH_CACHE_DIR/*
+
+    # (Re)create searchlight database
+    #recreate_database searchlight utf8
+
+    # Init and migrate searchlight database
+    #searchlight-manage database sync
+
+    if [ "$SEARCHLIGHT_POOL_MANAGER_CACHE_DRIVER" == "sqlalchemy" ]; then
+        # (Re)create searchlight_pool_manager cache
+        recreate_database searchlight_pool_manager utf8
+
+        # Init and migrate searchlight pool-manager-cache
+        searchlight-manage pool-manager-cache sync
+    fi
+}
+
+# install_searchlight - Collect source and prepare
+function install_searchlight {
+    git_clone $SEARCHLIGHT_REPO $SEARCHLIGHT_DIR $SEARCHLIGHT_BRANCH
+    setup_develop $SEARCHLIGHT_DIR
+}
+
+# install_searchlightclient - Collect source and prepare
+function install_searchlightclient {
+    git_clone $SEARCHLIGHTCLIENT_REPO $SEARCHLIGHTCLIENT_DIR $SEARCHLIGHTCLIENT_BRANCH
+    setup_develop $SEARCHLIGHTCLIENT_DIR
+}
+
+# install_searchlightdashboard - Collect source and prepare
+function install_searchlightdashboard {
+    ln -fs $SEARCHLIGHT_DIR/contrib/searchlight-dashboard/searchlightdashboard/enabled/_70_dns_add_group.py $HORIZON_DIR/openstack_dashboard/local/enabled/70_dns_add_group.py
+    ln -fs $SEARCHLIGHT_DIR/contrib/searchlight-dashboard/searchlightdashboard/enabled/_71_dns_project.py $HORIZON_DIR/openstack_dashboard/local/enabled/71_dns_project.py
+    setup_develop $SEARCHLIGHT_DIR/contrib/searchlight-dashboard
+}
+
+# start_searchlight - Start running processes, including screen
+function start_searchlight {
+    run_process searchlight-index "$SEARCHLIGHT_BIN_DIR/searchlight-index --config-file $SEARCHLIGHT_CONF"
+    run_process searchlight-api "$SEARCHLIGHT_BIN_DIR/searchlight-api --config-file $SEARCHLIGHT_CONF"
+
+    # Start proxies if enabled
+    if is_service_enabled searchlight-api && is_service_enabled tls-proxy; then
+        start_tls_proxy '*' $SEARCHLIGHT_SERVICE_PORT $SEARCHLIGHT_SERVICE_HOST $SEARCHLIGHT_SERVICE_PORT_INT &
+    fi
+
+    #if ! timeout $SERVICE_TIMEOUT sh -c "while ! wget --no-proxy -q -O- $SEARCHLIGHT_SERVICE_PROTOCOL://$SEARCHLIGHT_SERVICE_HOST:$SEARCHLIGHT_SERVICE_PORT; do sleep 1; done"; then
+    #    die $LINENO "Searchlight did not start"
+    #fi
+}
+
+# stop_searchlight - Stop running processes
+function stop_searchlight {
+    # Kill the searchlight screen windows
+    stop_process searchlight-index
+    stop_process searchlight-api
+}
+
+# Restore xtrace
+$XTRACE

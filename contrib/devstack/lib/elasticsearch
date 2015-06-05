@@ -1,0 +1,89 @@
+#!/bin/bash
+#
+# lib/elasticsearch
+# Install and start elasticsearch
+
+# To enable elasticsearch add the following to your localrc
+# enable_service elasticsearch
+
+# stack.sh
+# ----------
+# install_elasticsearch
+# configure_elasticsearch
+# init_elasticsearch
+# start_elasticsearch
+# stop_elasticsearch
+# cleanup_elasticsearch
+
+# Save trace setting
+XTRACE=$(set +o | grep xtrace)
+#set +o xtrace
+
+ELASTICSEARCH_VER=${ELASTICSEARCH_VER:-1.5}
+ELASTICSEARCH_CLUSTER_NAME=${ELASTICSEARCH_CLUSTER_NAME:-test}
+
+ELASTICSEARCH_HEAP_SIZE=${ELASTICSEARCH_HEAP_SIZE:-40M}
+ELASTICSEARCH_HEAP_NEWSIZE=${ELASTICSEARCH_HEAP_NEWSIZE:-100M}
+
+function install_jdk() {
+     if is_ubuntu; then
+         sudo apt-get -y install openjdk-7-jdk
+         sudo update-alternatives --set java /usr/lib/jvm/java-7-openjdk-amd64/jre/bin/java
+     elif is_fedora; then
+         sudo yum -y install java-1.7.0-openjdk java-1.7.0-openjdk-devel
+         sudo update-alternatives --set java /usr/lib/jvm/jre-1.7.0-openjdk.x86_64/bin/java
+     fi
+}
+
+function install_elasticsearch() {
+    install_jdk
+
+    if is_ubuntu; then
+        wget -qO - https://packages.elastic.co/GPG-KEY-elasticsearch | sudo apt-key add -
+        echo "deb http://packages.elastic.co/elasticsearch/$ELASTICSEARCH_VER/debian stable main" | sudo tee /etc/apt/sources.list.d/elasticsearch.list
+        sudo apt-get update
+        sudo apt-get install -qy elasticsearch
+        sudo update-rc.d elasticsearch defaults 95 10
+    elif is_fedora; then
+        sudo cat >>/etc/yum.repos.d/<<EOF
+[elasticsearch-$]
+name=Elasticsearch repository for $ELASTICSEARCH_VER packages
+baseurl=http://packages.elastic.co/elasticsearch/$ELASTICSEARCH_VER/centos
+gpgcheck=1
+gpgkey=http://packages.elastic.co/GPG-KEY-elasticsearch
+enabled=1
+EOF
+    sudo yum install -y elasticsearch
+    sudo chkconfig --add elasticsearch
+    fi
+}
+
+function wait_for_elasticsearch {
+    echo "Waiting for elasticsearch to come up..."
+
+    if ! timeout $SERVICE_TIMEOUT sh -c "while ! nc -ndz $SERVICE_HOST 9200; do sleep 1; done"; then
+        die $LINENO "Elasitcsearch didnt start"
+    fi
+}
+
+function start_elasticsearch() {
+    sudo service elasticsearch start
+    wait_for_elasticsearch
+}
+
+function stop_elasticsearch(){
+    sudo service elasticsearch stop
+}
+
+function cleanup_elasticsearch {
+    echo "Cleanup elasticsearch"
+    stop_elasticsearch
+    sudo rm -rf /var/lib/elasticsearch/*
+    start_elasticsearch
+}
+
+function configure_elasticsearch() {
+    sed -i -e 's/^#ES_HEAP_SIZE.*$/ES_HEAP_SIZE="'${ELASTICSEARCH_HEAP_SIZE}'"/' /etc/default/elasticsearch
+    sed -i -e 's/^#HEAP_NEWSIZE="800M"$/HEAP_NEWSIZE="'${ELASTICSEARCH_HEAP_NEWSIZE}'"/' /etc/default/elasticsearch
+}
+
